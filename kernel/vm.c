@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -53,7 +55,7 @@ void
 kvminithart()
 {
   w_satp(MAKE_SATP(kernel_pagetable));
-  sfence_vma();
+  sfence_vma();//刷新快表
 }
 
 // Return the address of the PTE in page table pagetable
@@ -132,7 +134,7 @@ kvmpa(uint64 va)
   pte_t *pte;
   uint64 pa;
   
-  pte = walk(kernel_pagetable, va, 0);
+  pte = walk(myproc()->kpagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
   if((*pte & PTE_V) == 0)
@@ -379,23 +381,24 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
+  /*uint64 n, va0, pa0;
 
   while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
+    va0 = PGROUNDDOWN(srcva);//找到srcva对应页表的起始地址
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
-    n = PGSIZE - (srcva - va0);
+    n = PGSIZE - (srcva - va0);//判断在当前的页表中需要copy的长度
     if(n > len)
       n = len;
     memmove(dst, (void *)(pa0 + (srcva - va0)), n);
 
     len -= n;
     dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+    srcva = va0 + PGSIZE;//到下一个页表中继续复制
+  }*/
+  
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -405,7 +408,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
+  /*uint64 n, va0, pa0;
   int got_null = 0;
 
   while(got_null == 0 && max > 0){
@@ -438,5 +441,75 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     return 0;
   } else {
     return -1;
+  }*/
+
+  return copyinstr_new(pagetable, dst, srcva, max);
+}
+
+void vmprint(pagetable_t pagetable, int level)
+{
+  if(level < 0) return;
+
+  if(level == 2) {
+    printf("page table %p\n", pagetable);
+  }
+
+  for(int i = 0; i < 512; i++) {
+    int index = level;
+    pte_t pte = pagetable[i];
+    if(pte & PTE_V) {
+      uint64 pa = PTE2PA(pte);
+      while(2 - index) {
+        printf(".. ");
+        index++;
+      }
+      printf("..%d: pte %p pa %p\n", i, pte, pa);
+      vmprint((pagetable_t)pa, level - 1);
+    }
+  }
+}
+
+void userKvmmap(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  if(mappages(pagetable, va, sz, pa, perm) != 0)
+    panic("userKvmmap");
+}
+
+
+pagetable_t userKvmPagetable_init(void)
+{
+  pagetable_t pt = uvmcreate();
+
+  userKvmmap(pt, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  userKvmmap(pt, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  
+  userKvmmap(pt, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+
+  userKvmmap(pt, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+
+  userKvmmap(pt, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+
+  userKvmmap(pt, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+
+  userKvmmap(pt, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  return pt;
+}
+
+void u2Kvmcopy(pagetable_t pagetable, pagetable_t kpagetable, uint64 oldsz, uint64 newsz) {
+  pte_t *pteFrom, *pteTo;
+
+  oldsz = PGROUNDUP(oldsz);
+
+  for(uint64 i = oldsz; i < newsz; i += PGSIZE) {
+    if((pteFrom = walk(pagetable, i, 0)) == 0) {
+      panic("u2Kvmcopy: src pte does not exits");
+    }
+    if((pteTo = walk(kpagetable, i, 1)) == 0) {
+      panic("u2Kvmcopy: pte walk failed");
+    }
+    uint64 pa = PTE2PA(*pteFrom);
+    uint flags = (PTE_FLAGS(*pteFrom)) & (~PTE_U);
+    *pteTo = PA2PTE(pa) | flags;
   }
 }
